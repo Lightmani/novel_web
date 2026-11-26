@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS progress (
 );
 CREATE INDEX IF NOT EXISTS progress_updated ON progress(updated);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rules (
+  id INTEGER PRIMARY KEY,
+  book_id INTEGER REFERENCES books(id) ON DELETE CASCADE,  -- NULL 表示全站规则
+  src TEXT NOT NULL,
+  dst TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS rules_key ON rules(IFNULL(book_id, 0), src);
 """
 
 LIST_COLS = 'id, title, author, category, size, words, chapters, intro'
@@ -143,6 +150,8 @@ class Library:
         self._toc_lock = threading.Lock()
         self._scan_lock = threading.Lock()
         self.scan_state = {'running': False}
+        self._rep = None  # {book_id 或 None: Replacer}，规则变更或扫描后置空、懒加载
+        self.rules_ver = int(self.meta_get('rules_ver', '0'))
 
     # ------------------------------------------------------------ 基础查询
     def query(self, sql, args=()):
@@ -272,6 +281,41 @@ class Library:
     def clear_history(self):
         self.execute('DELETE FROM progress WHERE book_id NOT IN (SELECT book_id FROM shelf)')
 
+    # ------------------------------------------------------------ 内容替换规则
+    def rules(self, book_id):
+        """book_id 为 None 时返回全站规则，否则返回该书自己的规则。"""
+        if book_id is None:
+            return self.query('SELECT id, src, dst FROM rules WHERE book_id IS NULL ORDER BY src')
+        return self.query('SELECT id, src, dst FROM rules WHERE book_id=? ORDER BY src', (book_id,))
+
+    def _rules_changed(self):
+        self.rules_ver += 1
+        self.meta_set('rules_ver', self.rules_ver)
+        self._rep = None
+
+    def add_rule(self, book_id, src, dst):
+        with self.lock:
+            self.execute('INSERT OR REPLACE INTO rules(book_id, src, dst) VALUES (?, ?, ?)', (book_id, src, dst))
+            self._rules_changed()
+
+    def del_rule(self, rule_id):
+        with self.lock:
+            if self.execute('DELETE FROM rules WHERE id=?', (rule_id,)):
+                self._rules_changed()
+
+    def replacer(self, book_id):
+        """返回该书的 Replacer（全站规则 + 本书规则，同名时本书优先）。
+        规则表很小，一次全部载入；只为有专属规则的书单独建表。"""
+        with self.lock:
+            if self._rep is None:
+                glob, per = {}, {}
+                for b, src, dst in self.query('SELECT book_id, src, dst FROM rules'):
+                    (glob if b is None else per.setdefault(b, {}))[src] = dst
+                self._rep = {None: tp.Replacer(glob)}
+                for b, m in per.items():
+                    self._rep[b] = tp.Replacer(dict(glob, **m))
+            return self._rep.get(book_id, self._rep[None])
+
     # ------------------------------------------------------------ 章节索引
     def toc(self, book):
         """返回解析好的目录（带内存 LRU 与持久缓存）。文件不存在时抛 OSError。"""
@@ -315,35 +359,72 @@ class Library:
             data = f.read(end - start)
         return tp.decode_display(data, toc['enc'])
 
-    def find_in_book(self, book, toc, q, limit=200):
-        pat = re.compile(re.escape(q), re.I)
-        hits = []
+    def iter_chapters(self, book, toc):
+        """逐章产出 (序号, 标题, 原文文本)。"""
         with open(self.abspath(book), 'rb') as f:
             for i, (title, start, end, _) in enumerate(toc['chapters']):
                 f.seek(start)
-                text = tp.decode_display(f.read(end - start), toc['enc'])
-                for m in pat.finditer(text):
-                    a, b = max(0, m.start() - 30), m.end() + 30
-                    hits.append((i, title, ' '.join(text[a:m.start()].split()), m.group(0),
-                                 ' '.join(text[m.end():b].split())))
-                    if len(hits) >= limit:
-                        return hits, True
+                yield i, title, tp.decode_display(f.read(end - start), toc['enc'])
+
+    def find_in_book(self, book, toc, q, limit=200):
+        """在「替换后」的文本里搜索：用户看到什么，就搜什么。"""
+        pat = re.compile(re.escape(q), re.I)
+        rep = self.replacer(book['id'])
+        hits = []
+        for i, title, text in self.iter_chapters(book, toc):
+            text = rep(text)
+            for m in pat.finditer(text):
+                a, b = max(0, m.start() - 30), m.end() + 30
+                hits.append((i, rep(title), ' '.join(text[a:m.start()].split()), m.group(0),
+                             ' '.join(text[m.end():b].split())))
+                if len(hits) >= limit:
+                    return hits, True
         return hits, False
 
-    def iter_utf8(self, book, toc):
-        """把原文件流式转成 UTF-8（下载用）。"""
+    def preview_rule(self, book, toc, global_rule, src, dst, limit=100):
+        """预览：在现有规则之上加入新规则后，src 在本书中实际被替换的位置（已排除被更长规则保护的地方）。
+
+        返回 (总处数, 样例, shadowed)。shadowed 表示要加的是全站规则，但本书已有同名专属规则，
+        在本书中仍以专属规则为准。
+        """
+        m = dict(self.replacer(book['id']).map)
+        shadowed = global_rule and any(r['src'] == src for r in self.rules(book['id']))
+        if not shadowed:
+            m[src] = dst
+        rep = tp.Replacer(m)
+        total, hits = 0, []
+        for i, title, text in self.iter_chapters(book, toc):
+            for mt in rep.rx.finditer(text):
+                if mt.group(0) != src:
+                    continue
+                total += 1
+                if len(hits) < limit:
+                    a, b = max(0, mt.start() - 20), mt.end() + 20
+                    hits.append((i, title, ' '.join(text[a:mt.start()].split()),
+                                 ' '.join(text[mt.end():b].split())))
+        return total, hits, shadowed
+
+    def iter_utf8(self, book, toc, rep=None):
+        """把原文件流式转成 UTF-8（下载用），可选应用替换规则。"""
         enc = toc['enc']
         with open(self.abspath(book), 'rb') as f:
             f.seek(toc['bom'])
             dec = codecs.getincrementaldecoder(enc)('replace')
+            carry = ''
             while True:
                 data = f.read(1 << 18)
+                text = dec.decode(data, not data)
+                if rep:
+                    # 规则不跨行：把最后一个换行之后的残行留到下一块，避免名字被块边界切开而漏替换
+                    text = carry + text
+                    cut = max(text.rfind('\n'), text.rfind('\r')) + 1 if data else len(text)
+                    if cut == 0 and len(text) > 1 << 22:  # 极端情况：4M 字内没有换行
+                        cut = len(text)
+                    text, carry = rep(text[:cut]), text[cut:]
+                if text:
+                    yield text.encode('utf-8')
                 if not data:
-                    tail = dec.decode(b'', True)
-                    if tail:
-                        yield tail.encode('utf-8')
                     return
-                yield dec.decode(data).encode('utf-8')
 
     # ------------------------------------------------------------ 扫描
     def scan(self, prune=False, log=None):
@@ -416,6 +497,8 @@ class Library:
             conn.execute('COMMIT')
             with self._toc_lock:
                 self._toc.clear()
+            with self.lock:  # 删书会级联删掉其规则，且 SQLite 可能复用最大的 id
+                self._rep = None
         except Exception as ex:  # noqa: BLE001 —— 扫描失败不能拖垮服务
             if conn is not None and conn.in_transaction:
                 conn.execute('ROLLBACK')

@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
@@ -175,6 +176,36 @@ class TestChapters(TempDirCase):
         self.assertEqual(len(tp.parse_book(path)['chapters']), 1)
 
 
+class TestReplacer(TempDirCase):
+    def test_semantics(self):
+        r = tp.Replacer({'唐三': '张三', '唐三十六': '唐三十六'})  # 恒等规则保护更长的词
+        self.assertEqual(r('唐三看了唐三十六一眼'), '张三看了唐三十六一眼')
+        self.assertEqual(tp.Replacer({'甲': '乙', '乙': '甲'})('甲打了乙'), '乙打了甲')  # 互换
+        self.assertEqual(tp.Replacer({'A': 'B', 'B': 'C'})('AB'), 'BC')  # 不连锁
+        self.assertEqual(tp.Replacer({'a.b': 'x'})('a.b acb'), 'x acb')  # 字面量，不是正则
+        self.assertFalse(tp.Replacer({}))
+        self.assertEqual(tp.Replacer({})('原样'), '原样')
+
+    def test_clean_rule(self):
+        self.assertEqual(tp.clean_rule(' 萧炎 ', ' 李明 '), ('萧炎', '李明'))
+        self.assertEqual(tp.clean_rule('广告', ''), ('广告', ''))
+        for src, dst in [('', 'x'), ('  ', 'x'), ('a\nb', 'x'), ('a', 'b\rc'), ('长' * 51, 'x'), ('a', '长' * 51)]:
+            with self.assertRaises(ValueError):
+                tp.clean_rule(src, dst)
+
+    def test_download_stream_does_not_miss_names_across_chunks(self):
+        head = '第1章 开始\n'.encode('utf-8')
+        pad = b'a' * ((1 << 18) - 3 - len(head))  # 让「萧炎」正好跨过第一个 256KB 读块的边界
+        self.write('lib/x.txt', head + pad + '萧炎\n萧炎走了。\n'.encode('utf-8') * 3)
+        lib = Library(os.path.join(self.dir, 'db.sqlite'), os.path.join(self.dir, 'lib'))
+        lib.scan()
+        book = lib.book(1)
+        out = b''.join(lib.iter_utf8(book, lib.toc(book), tp.Replacer({'萧炎': '李明'}))).decode('utf-8')
+        self.assertEqual((out.count('李明'), out.count('萧炎')), (6, 0))
+        self.assertTrue(out.startswith('第1章 开始\naaa'))
+        lib.conn.close()
+
+
 class TestWeb(TempDirCase):
     password = ''
 
@@ -265,6 +296,77 @@ class TestWebNoPassword(TestWeb):
         bid = self.book_id('测试之书')
         _, body, _ = self.req('/book/%d/find?q=%s' % (bid, urllib.request.quote('豪情')))
         self.assertIn('共 18 处', body)
+
+    # ---- 内容替换
+    def add_rule(self, bid, src, dst, scope='book', origin=True):
+        form = urllib.parse.urlencode({'book': bid, 'scope': scope, 'src': src, 'dst': dst}).encode()
+        return self.req('/rules', form, {'Origin': self.base} if origin else {})
+
+    def get(self, path):
+        return self.req(urllib.request.quote(path, safe='/?=&#'))
+
+    def test_rules_apply_everywhere_the_reader_looks(self):
+        bid = self.book_id('测试之书')
+        other = self.lib.one('SELECT id FROM books WHERE id != ?', (bid,))[0]
+        _, body, _ = self.get('/book/%d/rule?src=豪情&dst=壮志' % bid)
+        self.assertIn('共 18 处', body)
+        self.assertEqual(self.add_rule(bid, '豪情', '壮志', origin=False)[0], 303)
+        self.assertEqual(self.add_rule(bid, '远处', '<b>远方</b>', scope='all')[0], 303)
+        _, body, _ = self.get('/read/%d/2' % bid)
+        self.assertIn('壮志', body)
+        self.assertNotIn('豪情', body)
+        self.assertIn('&lt;b&gt;远方&lt;/b&gt;', body)  # 先替换、后转义
+        self.assertNotIn('<b>远方', body)
+        self.assertIn('/read/%d/3?r=2' % bid, body)  # 链接带规则版本号，绕开章节页缓存
+        _, body, _ = self.get('/read/%d/2' % other)  # 全站规则作用于其他书，本书专属规则不会
+        self.assertIn('&lt;b&gt;远方', body)
+        self.assertIn('豪情', body)
+        self.assertIn('共 18 处', self.get('/book/%d/find?q=壮志' % bid)[1])  # 看到什么就搜什么
+        self.assertIn('没有找到', self.get('/book/%d/find?q=豪情' % bid)[1])
+        self.assertIn('壮志', self.get('/dl/%d' % bid)[1])
+        self.assertIn('豪情', self.get('/dl/%d?raw=1' % bid)[1])
+        self.assertIn('本书 1 条 · 全站 1 条', self.get('/book/%d' % bid)[1])
+        # 全站同名规则：本书仍以专属规则为准
+        self.assertIn('以专属规则为准', self.get('/book/%d/rule?src=豪情&dst=X&scope=all' % bid)[1])
+        # 删除后恢复原文
+        for r in self.lib.query('SELECT id FROM rules'):
+            self.assertEqual(self.req('/rules/delete', ('id=%d&back=/manage' % r['id']).encode())[0], 303)
+        _, body, _ = self.get('/read/%d/2' % bid)
+        self.assertIn('豪情', body)
+        self.assertIn('/read/%d/3?r=4' % bid, body)
+
+    def test_protect_rule_delete_rule_and_titles(self):
+        text = ('第1章 萧炎出山\n萧炎看着树林动了起来。\n本章完，请访问www.example.com\n林动拔剑。\n'
+                '第2章 再会\n林动与萧炎再会。\n')
+        self.write('lib/x/林动传.txt', text.encode('utf-8'))
+        self.lib.scan()
+        bid = self.book_id('林动传')
+        _, body, _ = self.get('/book/%d/rule?src=林动&dst=李明' % bid)
+        self.assertIn('共 3 处', body)  # 含「树林动」的误伤
+        self.add_rule(bid, '树林动', '树林动')  # 保护规则
+        self.assertIn('共 2 处', self.get('/book/%d/rule?src=林动&dst=李明' % bid)[1])
+        self.add_rule(bid, '林动', '李明')
+        self.add_rule(bid, '萧炎', '王五')
+        self.add_rule(bid, '本章完，请访问www.example.com', '')  # 留空即删除，整段消失
+        _, body, _ = self.get('/read/%d/1' % bid)
+        self.assertIn('<h1>第1章 王五出山</h1>', body)
+        self.assertIn('树林动了起来', body)
+        self.assertIn('<p>李明拔剑。</p>', body)
+        self.assertNotIn('本章完', body)
+        self.assertNotIn('<p></p>', body)
+        self.assertIn('第1章 王五出山', self.get('/book/%d' % bid)[1])
+        self.req('/api/progress', json.dumps({'b': bid, 'c': 1, 'p': 0}).encode(), {'Content-Type': 'application/json'})
+        self.assertIn('读到 第1章 王五出山', self.get('/history')[1])
+
+    def test_rule_validation_and_csrf(self):
+        bid = self.book_id('测试之书')
+        self.assertEqual(self.add_rule(bid, '', 'x')[0], 400)
+        self.assertEqual(self.add_rule(bid, 'a\nb', 'x')[0], 400)
+        self.assertEqual(self.add_rule(99999, 'a', 'x')[0], 404)
+        form = urllib.parse.urlencode({'book': bid, 'src': 'a', 'dst': 'b'}).encode()
+        self.assertEqual(self.req('/rules', form, {'Origin': 'http://evil.example'})[0], 403)
+        self.assertEqual(self.lib.one('SELECT COUNT(*) FROM rules')[0], 0)
+        self.assertEqual(self.req('/rules/delete', b'id=1&back=//evil.example')[0], 303)
 
 
 class TestWebPassword(TestWeb):

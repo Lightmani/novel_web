@@ -35,7 +35,7 @@ h2 { font-size: 18px; margin: 28px 0 10px; display: flex; align-items: baseline;
 .m a { color: inherit; }
 
 /* 表单与按钮 */
-input[type="search"], input[type="password"], input[type="number"] {
+input[type="search"], input[type="password"], input[type="number"], input[type="text"], select {
   font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line);
   border-radius: 6px; padding: 6px 10px; min-width: 0;
 }
@@ -106,6 +106,19 @@ header nav a { color: var(--fg); }
 .toc li a { color: var(--fg); }
 .toc li.vol { grid-column: 1 / -1; padding-top: 18px; font-weight: 700; white-space: normal; border-bottom: 1px solid var(--line); }
 .toc li.cur a { color: var(--accent); font-weight: 600; }
+.rules { margin: 20px 0 0; padding: 8px 14px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; }
+.rules summary { cursor: pointer; font-weight: 600; }
+.rlist { list-style: none; padding: 0; margin: 8px 0; }
+.rlist li { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 6px 0; border-bottom: 1px dashed var(--line); }
+.rlist form { margin: 0 0 0 auto; }
+.rlist button { padding: 2px 10px; font-size: 13px; }
+.rlist i { color: var(--muted); }
+.ar { color: var(--muted); }
+.tag { font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 0 8px; }
+.rule { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 10px 0 4px; }
+.rule input { flex: 1 1 9em; }
+del { color: var(--warn); }
+ins { text-decoration: none; background: var(--mark); color: var(--fg); border-radius: 2px; }
 .hits { padding-left: 1.6em; }
 .hits li { margin: 10px 0; }
 .hits p { margin: 2px 0; color: var(--muted); }
