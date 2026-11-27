@@ -161,6 +161,7 @@ ROUTES = [
     ('GET', r'/random', 'random'),
     ('GET', r'/book/(\d{1,10})', 'book'),
     ('GET', r'/book/(\d{1,10})/find', 'find'),
+    ('GET', r'/book/(\d{1,10})/rule', 'rule_preview'),
     ('GET', r'/read/(\d{1,10})', 'resume'),
     ('GET', r'/read/(\d{1,10})/(\d{1,7})', 'read'),
     ('GET', r'/dl/(\d{1,10})', 'download'),
@@ -174,6 +175,8 @@ ROUTES = [
     ('POST', r'/history/clear', 'history_clear'),
     ('POST', r'/api/progress', 'api_progress'),
     ('POST', r'/manage/scan', 'manage_scan'),
+    ('POST', r'/rules', 'rule_add'),
+    ('POST', r'/rules/delete', 'rule_delete'),
 ]
 PUBLIC = {'login_form', 'login', 'static', 'robots'}
 
@@ -294,6 +297,11 @@ class App:
         body = '<div class="empty"><h1>%d</h1><p>%s</p><p><a href="/">返回首页</a></p></div>' % (status, esc(msg))
         return Response(self.layout('出错了', body), status)
 
+    def read_url(self, bid, n, hl=None):
+        """章节链接带上规则版本号：改了规则就换 URL，绕开章节页的短时缓存，同时不影响「预取下一章」。"""
+        q = qs(r=self.lib.rules_ver or None, hl=hl)
+        return '/read/%d/%d' % (bid, n) + ('?' + q if q else '')
+
     def book_li(self, r, show_cat=True):
         meta = []
         if r['author']:
@@ -301,7 +309,7 @@ class App:
         if show_cat and r['category']:
             meta.append('<a href="/browse?%s">%s</a>' % (esc(qs(dir=r['category'])), esc(r['category'])))
         meta.append(fmt_words(r['words']) or fmt_size(r['size']))
-        intro = ' '.join((r['intro'] or '').split())
+        intro = self.lib.replacer(r['id'])(' '.join((r['intro'] or '').split()))
         return ('<li><a class="t" href="/book/%d">%s</a><div class="m">%s</div>%s</li>'
                 % (r['id'], esc(r['title']), ' · '.join(meta),
                    '<p class="i">%s</p>' % esc(intro) if intro else ''))
@@ -333,7 +341,7 @@ class App:
 
     def progress_li(self, r, shelf=False):
         if r['updated']:
-            info = '读到 %s · %d%% · %s' % (esc(r['ch_title']), pct(r['byte_off'], r['size']),
+            info = '读到 %s · %d%% · %s' % (esc(self.lib.replacer(r['id'])(r['ch_title'])), pct(r['byte_off'], r['size']),
                                           fmt_time(r['updated']))
             act = '<a class="btn pri" href="/read/%d">继续阅读</a>' % r['id']
         else:
@@ -472,6 +480,7 @@ class App:
             return err
         bid = book['id']
         prog = self.lib.progress(bid)
+        rep = self.lib.replacer(bid)
         chapters, vols = toc['chapters'], toc['vols']
         meta = []
         if book['author']:
@@ -482,34 +491,121 @@ class App:
         if prog:
             n = self.lib.chapter_at(toc, prog['byte_off']) + 1
             main_btn = ('<a class="btn pri" href="/read/%d">继续阅读：%s</a>'
-                        % (bid, esc(chapters[n - 1][0])))
+                        % (bid, esc(rep(chapters[n - 1][0]))))
         else:
-            main_btn = '<a class="btn pri" href="/read/%d/1">开始阅读</a>' % bid
+            main_btn = '<a class="btn pri" href="%s">开始阅读</a>' % esc(self.read_url(bid, 1))
             n = 0
         on = self.lib.on_shelf(bid)
         shelf_btn = ('<form method="post" action="/shelf"><input type="hidden" name="id" value="%d">'
                      '<input type="hidden" name="on" value="%d"><input type="hidden" name="back" value="/book/%d">'
                      '<button type="submit" class="btn">%s</button></form>'
                      % (bid, 0 if on else 1, bid, '移出书架' if on else '加入书架'))
-        intro = ''.join('<p>%s</p>' % esc(l) for l in (book['intro'] or '').split('\n') if l.strip())
+        intro = ''.join('<p>%s</p>' % esc(rep(l)) for l in (book['intro'] or '').split('\n') if l.strip())
         items, cur_vol = [], None
         for i, (title, _, _, vol) in enumerate(chapters):
             if vol != cur_vol:
                 cur_vol = vol
                 if vol >= 0:
-                    items.append('<li class="vol">%s</li>' % esc(vols[vol]))
-            items.append('<li%s><a href="/read/%d/%d">%s</a></li>'
-                         % (' class="cur"' if i + 1 == n else '', bid, i + 1, esc(title)))
+                    items.append('<li class="vol">%s</li>' % esc(rep(vols[vol])))
+            items.append('<li%s><a href="%s">%s</a></li>'
+                         % (' class="cur"' if i + 1 == n else '', esc(self.read_url(bid, i + 1)), esc(rep(title))))
+        dl = ('<a class="btn" href="/dl/%d">下载 TXT（已替换）</a><a class="btn" href="/dl/%d?raw=1">下载原文</a>'
+              % (bid, bid) if rep else '<a class="btn" href="/dl/%d">下载 TXT</a>' % bid)
         body = ('<article class="detail"><h1>%s</h1><div class="m">%s</div>%s'
-                '<div class="acts">%s%s<a class="btn" href="/dl/%d">下载 TXT</a></div>'
+                '<div class="acts">%s%s%s</div>'
                 '<form class="find" action="/book/%d/find"><input type="search" name="q" placeholder="书内搜索" '
                 'aria-label="书内搜索" required><button type="submit">搜索</button></form>'
-                '<div class="path">%s</div></article>'
+                '<div class="path">%s</div></article>%s'
                 '<h2 id="toc">目录</h2><ol class="toc">%s</ol>'
                 % (esc(book['title']), ' · '.join(m for m in meta if m),
-                   '<div class="intro">%s</div>' % intro if intro else '', main_btn, shelf_btn, bid, bid,
-                   esc(tp.bytes_display(bytes(book['path']))), ''.join(items)))
+                   '<div class="intro">%s</div>' % intro if intro else '', main_btn, shelf_btn, dl, bid,
+                   esc(tp.bytes_display(bytes(book['path']))), self.rules_box(bid, bool(req.arg('rules'))),
+                   ''.join(items)))
         return self.page('%s - %s' % (book['title'], self.name), body)
+
+    # ------------------------------------------------------------ 内容替换
+    def rule_items(self, rows, back, tag=''):
+        return ''.join('<li><span class="rs">%s</span><span class="ar">→</span><span class="rd">%s</span>%s'
+                       '<form method="post" action="/rules/delete"><input type="hidden" name="id" value="%d">'
+                       '<input type="hidden" name="back" value="%s"><button type="submit">删除</button></form></li>'
+                       % (esc(r['src']), esc(r['dst']) if r['dst'] else '<i>（删除）</i>', tag, r['id'], esc(back))
+                       for r in rows)
+
+    def rules_box(self, bid, open_):
+        own, glob = self.lib.rules(bid), self.lib.rules(None)
+        back = '/book/%d?rules=1#rules' % bid
+        items = self.rule_items(own, back) + self.rule_items(glob, back, '<span class="tag">全站</span>')
+        return ('<details id="rules" class="rules"%s><summary>内容替换（本书 %d 条 · 全站 %d 条）</summary>%s'
+                '<form class="rule" action="/book/%d/rule">'
+                '<input type="text" name="src" placeholder="原文，如：萧炎" aria-label="原文" maxlength="%d" required>'
+                '<span class="ar">→</span>'
+                '<input type="text" name="dst" placeholder="替换为（可留空）" aria-label="替换为" maxlength="%d">'
+                '<select name="scope" aria-label="范围"><option value="book">仅本书</option>'
+                '<option value="all">全站</option></select><button type="submit">预览</button></form>'
+                '<p class="m">只改变显示，从不修改原文件；作用于正文、章节名、简介、书内搜索和下载。替换为留空即删除（可用来去广告行）。'
+                '较长的词优先匹配：误伤时可加一条「保护规则」，例如把「树林动」替换为「树林动」，'
+                '「林动」就不会再命中它。</p></details>'
+                % (' open' if open_ else '', len(own), len(glob),
+                   '<ul class="rlist">%s</ul>' % items if items else '', bid, tp.RULE_MAX, tp.RULE_MAX))
+
+    def rule_preview(self, req, book_id):
+        book, toc, err = self._load(book_id)
+        if err:
+            return err
+        try:
+            src, dst = tp.clean_rule(req.arg('src'), req.arg('dst'))
+        except ValueError as ex:
+            return self.error(400, str(ex))
+        bid, glob = book['id'], req.arg('scope') == 'all'
+        total, hits, shadowed = self.lib.preview_rule(book, toc, glob, src, dst)
+        if src == dst:
+            mid, what = '<mark>%s</mark>' % esc(src), '保持原样（保护规则）'
+        elif shadowed:
+            mid, what = '<mark>%s</mark>' % esc(src), '仍按本书已有的专属规则替换'
+        else:
+            mid = '<del>%s</del>%s' % (esc(src), '<ins>%s</ins>' % esc(dst) if dst else '')
+            what = '替换' if dst else '删除'
+        items = ''.join('<li><a href="%s">%s</a><p>…%s%s%s…</p></li>'
+                        % (esc(self.read_url(bid, i + 1)), esc(t), esc(a), mid, esc(b)) for i, t, a, b in hits)
+        note = ('<p class="notice">本书已有同名专属规则，在本书中以专属规则为准；这条全站规则对其他书生效。</p>'
+                if shadowed else '')
+        body = ('<nav class="crumbs"><a href="/book/%d">%s</a> / 内容替换预览</nav>'
+                '<h1>「%s」→「%s」<small>%s</small></h1>%s'
+                '<p>在本书中共 %d 处将%s%s。请检查下面的上下文（显示原文）有没有误伤。</p>'
+                '<div class="acts"><form method="post" action="/rules">'
+                '<input type="hidden" name="book" value="%d"><input type="hidden" name="scope" value="%s">'
+                '<input type="hidden" name="src" value="%s"><input type="hidden" name="dst" value="%s">'
+                '<button type="submit" class="btn pri">确认添加</button></form>'
+                '<a class="btn" href="/book/%d?rules=1#rules">返回</a></div>%s'
+                % (bid, esc(book['title']), esc(src), esc(dst), '全站' if glob else '仅本书', note, total, what,
+                   '（以下仅列出前 %d 处）' % len(hits) if total > len(hits) else '', bid,
+                   'all' if glob else 'book', esc(src), esc(dst), bid,
+                   '<ol class="hits">%s</ol>' % items if items else '<p class="empty">本书中没有命中。</p>'))
+        return self.page('内容替换预览 - %s' % book['title'], body)
+
+    def rule_add(self, req):
+        f = req.form
+        try:
+            src, dst = tp.clean_rule(f.get('src'), f.get('dst'))
+        except ValueError as ex:
+            return self.error(400, str(ex))
+        try:
+            bid = int(f.get('book', ''))
+        except ValueError:
+            return self.error(400, '参数错误')
+        if self.lib.book(bid) is None:
+            return self.error(404, '书不存在')
+        self.lib.add_rule(None if f.get('scope') == 'all' else bid, src, dst)
+        return redirect('/book/%d?rules=1#rules' % bid)
+
+    def rule_delete(self, req):
+        f = req.form
+        try:
+            rid = int(f.get('id', ''))
+        except ValueError:
+            return self.error(400, '参数错误')
+        self.lib.del_rule(rid)
+        return redirect(safe_next(f.get('back')))
 
     def resume(self, req, book_id):
         book, toc, err = self._load(book_id)
@@ -517,9 +613,9 @@ class App:
             return err
         prog = self.lib.progress(book['id'])
         if not prog:
-            return redirect('/read/%d/1' % book['id'])
+            return redirect(self.read_url(book['id'], 1))
         n = self.lib.chapter_at(toc, prog['byte_off']) + 1
-        return redirect('/read/%d/%d#pos=%.3f' % (book['id'], n, prog['pos']))
+        return redirect('%s#pos=%.3f' % (self.read_url(book['id'], n), prog['pos']))
 
     def read(self, req, book_id, num):
         book, toc, err = self._load(book_id)
@@ -529,7 +625,11 @@ class App:
         if not 1 <= n <= len(chapters):
             return redirect('/book/%d#toc' % bid)
         title, _, _, vol = chapters[n - 1]
-        paras = tp.chapter_paragraphs(self.lib.chapter_text(book, toc, n - 1), title)
+        paras = tp.chapter_paragraphs(self.lib.chapter_text(book, toc, n - 1), title)  # 先按原文去重标题
+        rep = self.lib.replacer(bid)
+        if rep:  # 先替换、后转义；替换后为空的段落（整行被删除）直接去掉
+            paras = [p for p in map(rep, paras) if p.strip()]
+            title = rep(title)
         hl = req.arg('hl')[:50]
         if hl:
             rx = re.compile('(%s)' % re.escape(hl), re.I)
@@ -537,12 +637,12 @@ class App:
                                                  for i, s in enumerate(rx.split(p))) for p in paras)
         else:
             text = ''.join('<p>%s</p>' % esc(p) for p in paras)
-        prev_url = '/read/%d/%d' % (bid, n - 1) if n > 1 else ''
-        next_url = '/read/%d/%d' % (bid, n + 1) if n < len(chapters) else ''
+        prev_url = esc(self.read_url(bid, n - 1)) if n > 1 else ''
+        next_url = esc(self.read_url(bid, n + 1)) if n < len(chapters) else ''
         nav = ('<nav class="rnav">%s<a href="/book/%d#toc">目录</a>%s</nav>'
                % ('<a href="%s" rel="prev">上一章</a>' % prev_url if prev_url else '<span>已是第一章</span>', bid,
                   '<a href="%s" rel="next">下一章</a>' % next_url if next_url else '<span>已是最后一章</span>'))
-        vol_html = '<div class="vol">%s</div>' % esc(toc['vols'][vol]) if vol >= 0 else ''
+        vol_html = '<div class="vol">%s</div>' % esc(rep(toc['vols'][vol])) if vol >= 0 else ''
         body = ('<div class="rbar"><a class="back" href="/book/%d">‹ %s</a><span class="ct">%d / %d</span>'
                 '<button type="button" id="set" aria-label="阅读设置" aria-expanded="false">Aa</button></div>'
                 '<div id="panel" class="panel" hidden>'
@@ -564,7 +664,8 @@ class App:
                 % (bid, esc(book['title']), n, len(chapters), bid, n, prev_url, next_url, vol_html, esc(title),
                    text or '<p class="empty">（本章无内容）</p>', nav,
                    '<link rel="prefetch" href="%s">' % next_url if next_url else ''))
-        # 章节页只取决于文件内容（进度由 JS 另行上报），允许短时缓存，让「预取下一章」真正生效
+        # 章节页只取决于文件内容与替换规则（进度由 JS 另行上报；规则变更会改变链接里的版本号），
+        # 允许短时缓存，让「预取下一章」真正生效
         return self.page('%s - %s' % (title, book['title']), body, bare=True, cls='reading',
                          cache='private, max-age=300')
 
@@ -576,8 +677,8 @@ class App:
         if not q:
             return redirect('/book/%d' % book['id'])
         hits, more = self.lib.find_in_book(book, toc, q)
-        items = ''.join('<li><a href="/read/%d/%d?%s">%s</a><p>…%s<mark>%s</mark>%s…</p></li>'
-                        % (book['id'], i + 1, esc(qs(hl=q)), esc(t), esc(a), esc(m), esc(b))
+        items = ''.join('<li><a href="%s">%s</a><p>…%s<mark>%s</mark>%s…</p></li>'
+                        % (esc(self.read_url(book['id'], i + 1, hl=q)), esc(t), esc(a), esc(m), esc(b))
                         for i, t, a, m, b in hits)
         body = ('<nav class="crumbs"><a href="/book/%d">%s</a> / 书内搜索</nav>'
                 '<form class="find" action="/book/%d/find"><input type="search" name="q" value="%s" aria-label="书内搜索">'
@@ -595,7 +696,8 @@ class App:
         disp = "attachment; filename=\"%s\"; filename*=UTF-8''%s" % (ascii_name, quote(name, safe=''))
         headers = [('Content-Disposition', disp), ('Cache-Control', 'private, no-cache')]
         ctype = 'text/plain; charset=utf-8'
-        if toc['enc'] == 'utf-8' and toc['bom'] == 0:  # 原本就是 UTF-8：直接按原文件发送
+        rep = None if req.arg('raw') else self.lib.replacer(book['id'])
+        if not rep and toc['enc'] == 'utf-8' and toc['bom'] == 0:  # 原本就是 UTF-8 且无需替换：直接发送原文件
             path = self.lib.abspath(book)
             size = os.path.getsize(path)
 
@@ -607,7 +709,7 @@ class App:
                             return
                         yield chunk
             return Response(status=200, ctype=ctype, headers=headers, stream=raw(), length=size)
-        return Response(status=200, ctype=ctype, headers=headers, stream=self.lib.iter_utf8(book, toc))
+        return Response(status=200, ctype=ctype, headers=headers, stream=self.lib.iter_utf8(book, toc, rep))
 
     # ------------------------------------------------------------ 写操作
     def shelf_toggle(self, req):
@@ -656,14 +758,18 @@ class App:
             scan += '<p class="notice warn">%s</p>' % esc(st['error'])
         logout = ('<form method="post" action="/logout"><button type="submit" class="btn">退出登录</button></form>'
                   if self.password else '')
+        glob = self.rule_items(self.lib.rules(None), '/manage')
+        rules = ('<h2>全站替换规则</h2>%s<p class="m">在任意书籍详情页的「内容替换」中添加，范围选「全站」。'
+                 '同一原文若某本书另有专属规则，该书以专属规则为准。</p>'
+                 % ('<ul class="rlist">%s</ul>' % glob if glob else '<p>暂无。</p>'))
         body = ('<h1>管理</h1><dl class="kv"><dt>书库目录</dt><dd>%s</dd><dt>书籍</dt><dd>%d 本 · %s</dd>'
                 '<dt>已解析目录</dt><dd>%d 本（打开过的书才会解析）</dd><dt>数据库</dt><dd>%s · %s</dd>'
                 '<dt>上次扫描完成</dt><dd>%s</dd></dl><h2>扫描书库</h2>%s'
                 '<form method="post" action="/manage/scan"><button type="submit" class="btn pri"%s>重新扫描</button>'
-                '</form><p class="m">增量扫描：只处理新增、改动、移动和删除的文件。</p>%s'
+                '</form><p class="m">增量扫描：只处理新增、改动、移动和删除的文件。</p>%s%s'
                 % (esc(self.lib.root), s['books'], fmt_size(s['bytes']), s['parsed'], esc(self.lib.db_path),
                    fmt_size(s['dbsize']), fmt_time(s['last_scan']) or '从未', scan,
-                   ' disabled' if st.get('running') else '', logout))
+                   ' disabled' if st.get('running') else '', rules, logout))
         return self.page('管理 - ' + self.name, body, refresh=2 if st.get('running') else 0)
 
     def manage_scan(self, req):

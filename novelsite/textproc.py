@@ -418,6 +418,45 @@ def read_head(path, n=4096):
     return enc, decode_display(data[bom:], enc)
 
 
+# ---------------------------------------------------------------- 内容替换（只作用于显示，从不改原文件）
+
+RULE_MAX = 50
+
+
+class Replacer:
+    """字面量替换：所有规则合成一个按长度降序的交替式，单趟扫描。
+
+    - 最长优先：「唐三十六→唐三十六」这样的恒等规则可以保护较长的词不被「唐三」误伤；
+    - 单趟：A→B、B→A 可以互换，A→B、B→C 不会连锁成 A→C。
+    规则不含换行，因此按行（段落）处理与按整段文本处理结果一致。
+    """
+
+    def __init__(self, mapping=None):
+        self.map = {k: v for k, v in (mapping or {}).items() if k}
+        keys = sorted(self.map, key=len, reverse=True)
+        self.rx = re.compile('|'.join(map(re.escape, keys))) if keys else None
+
+    def __bool__(self):
+        return self.rx is not None
+
+    def __call__(self, s):
+        if self.rx is None or not s:
+            return s
+        return self.rx.sub(lambda m: self.map[m.group(0)], s)
+
+
+def clean_rule(src, dst):
+    """校验一条规则，返回 (src, dst)；不合法时抛 ValueError（消息可直接展示）。"""
+    src, dst = (src or '').strip(), (dst or '').strip()
+    if not src:
+        raise ValueError('原文不能为空')
+    if '\n' in src + dst or '\r' in src + dst:
+        raise ValueError('规则不能包含换行')
+    if len(src) > RULE_MAX or len(dst) > RULE_MAX:
+        raise ValueError('原文和替换内容都不能超过 %d 字' % RULE_MAX)
+    return src, dst
+
+
 def chapter_paragraphs(text, title):
     """正文 → 段落列表；若首段与标题重复则去掉。"""
     lines = [l.strip() for l in text.replace('\r', '\n').split('\n')]
