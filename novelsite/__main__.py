@@ -30,8 +30,9 @@ def _password(args):
 def _log_scan(st):
     if st.get('error'):
         print('[scan] ' + st['error'], file=sys.stderr)
-    print('[scan] 发现 %d 本，新增 %d，更新 %d，移动 %d，移除 %d，用时 %.1f 秒'
+    print('[scan] 发现 %d 本，新增 %d，更新 %d，移动 %d，移除 %d%s，用时 %.1f 秒'
           % (st['found'], st['added'], st['updated'], st['moved'], st['removed'],
+             '，按新规则刷新书名/作者 %d' % st['refreshed'] if st.get('refreshed') else '',
              (st['finished'] or 0) - st['started']), file=sys.stderr)
 
 

@@ -12,6 +12,7 @@ import os
 import re
 
 PARSER_VERSION = 1
+META_VERSION = 2  # 文件名 / 文件头元数据规则的版本；变化后，下次扫描会刷新已入库书籍的书名、作者与简介
 
 # ---------------------------------------------------------------- 编码识别
 
@@ -106,6 +107,9 @@ _TAIL_BRACKET = re.compile(r'\s*[\[【(（〔［][^\]】)）〕］]{0,30}[\]】)
 # 「作者」前必须有分隔符/括号，或后面跟冒号，避免把《我的作者大人》拆坏
 _AUTHOR_MARK = re.compile(r'(?:[\s_\-—]+[\[【(（]?|[\[【(（])\s*作者\s*[:：]?\s*(?=\S)|作者\s*[:：]\s*(?=\S)')
 _AUTHOR_CUT = re.compile(r'[\s()（）\[\]【】<>《》,，。;；|/\\]')
+# 文件名开头的纯数字编号：「1006_小琳」「1006 小琳」「1006-小琳」「1006.小琳」「1006、小琳」。
+# 小数点后紧跟数字时不算编号（「3.5亿的人生」）；只有编号、后面没有书名时也不算（「1984」）。
+_SERIAL = re.compile(r'^[0-9０-９]{1,12}(?:[ \t　]*[_\-—、＿－][ \t　]*|[ \t　]+|[.．](?![0-9０-９])[ \t　]*)(?=\S)')
 
 
 def clean_author(s):
@@ -135,8 +139,16 @@ def _strip_decor(s):
 
 
 def parse_filename(stem):
-    """从文件名（不含扩展名）猜测 (书名, 作者, 标签, 作者是否来自明确标记)。"""
+    """从文件名（不含扩展名）猜测 (书名, 作者, 标签, 作者是否来自明确标记)。
+
+    开头的数字编号会被去掉；带编号的文件名视为「编号_书名」格式，下划线后面是书名的一部分，
+    不再按「书名_作者」猜作者（作者只认明确的「作者：」标记，或交给文件头）。
+    """
     s = stem.strip()
+    m = _SERIAL.match(s)
+    numbered = m is not None
+    if numbered:
+        s = s[m.end():]
     author = ''
     m = _AUTHOR_MARK.search(s)
     if m and m.start() > 0:
@@ -156,7 +168,7 @@ def parse_filename(stem):
             tag = lead.group(1).strip()
     else:
         title, tag = _strip_decor(s)
-        if not author and '_' in title:
+        if not author and not numbered and '_' in title:
             left, right = title.rsplit('_', 1)
             if left.strip() and 1 <= len(right.strip()) <= 16:
                 title, author, guessed = left.strip(), clean_author(right), True

@@ -432,7 +432,8 @@ class Library:
         if not self._scan_lock.acquire(blocking=False):
             return False
         st = {'running': True, 'phase': '遍历目录', 'found': 0, 'done': 0, 'total': 0, 'added': 0,
-              'updated': 0, 'moved': 0, 'removed': 0, 'started': time.time(), 'finished': None, 'error': ''}
+              'updated': 0, 'moved': 0, 'removed': 0, 'refreshed': 0, 'started': time.time(), 'finished': None,
+              'error': ''}
         self.scan_state = st
         conn = None
         try:
@@ -441,7 +442,10 @@ class Library:
             conn = connect(self.db_path)
             existing = {bytes(r[1]): (r[0], r[2], r[3])
                         for r in conn.execute('SELECT id, path, size, mtime FROM books')}
-            seen, new, changed = set(), [], []
+            # 元数据规则升级后，未改动的书也要按新规则重新提取书名 / 作者（保留 id，书架与进度不受影响）
+            row = conn.execute("SELECT v FROM meta WHERE k='meta_version'").fetchone()
+            stale_meta = (row[0] if row else '1') != str(tp.META_VERSION)
+            seen, new, changed, refresh = set(), [], [], []
             for rel, full, size, mtime in walk_txt(self.root_b):
                 seen.add(rel)
                 st['found'] += 1
@@ -450,12 +454,14 @@ class Library:
                     new.append((rel, full, size, mtime))
                 elif e[1] != size or e[2] != mtime:
                     changed.append((e[0], rel, full, size, mtime))
+                elif stale_meta:
+                    refresh.append((e[0], rel, full))
             missing = {rel: v for rel, v in existing.items() if rel not in seen}
             by_sig = {}
             for rel, (_, size, mtime) in missing.items():
                 by_sig.setdefault((size, mtime), []).append(rel)
 
-            st['phase'], st['total'] = '读取元数据', len(new) + len(changed)
+            st['phase'], st['total'] = '读取元数据', len(new) + len(changed) + len(refresh)
             now = int(time.time())
             conn.execute('BEGIN')
             batch = 0
@@ -486,6 +492,17 @@ class Library:
                 conn.execute('DELETE FROM toc WHERE book_id=?', (bid,))
                 st['updated'] += 1
                 st['done'] += 1
+            for bid, rel, full in refresh:
+                title, author, cat, _, intro = file_meta(rel, full)
+                conn.execute('UPDATE books SET title=?, author=?, category=?, intro=? WHERE id=?',
+                             (title, author, cat, intro, bid))
+                st['refreshed'] += 1
+                st['done'] += 1
+                batch += 1
+                if batch >= 500:
+                    conn.execute('COMMIT')
+                    conn.execute('BEGIN')
+                    batch = 0
             if missing:
                 if not prune and len(missing) > 100 and len(missing) > len(existing) // 2:
                     st['error'] = ('有 %d 本书找不到了（超过原有一半），疑似书库未挂载，已跳过删除。'
@@ -494,6 +511,8 @@ class Library:
                     conn.executemany('DELETE FROM books WHERE id=?', [(v[0],) for v in missing.values()])
                     st['removed'] = len(missing)
             conn.execute('INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)', ('last_scan', str(now)))
+            if not st['error']:  # 疑似书库未挂载时不记版本，下次扫描再刷新
+                conn.execute('INSERT OR REPLACE INTO meta(k, v) VALUES (?, ?)', ('meta_version', str(tp.META_VERSION)))
             conn.execute('COMMIT')
             with self._toc_lock:
                 self._toc.clear()
