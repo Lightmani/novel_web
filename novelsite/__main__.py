@@ -43,8 +43,13 @@ def cmd_serve(args):
         sys.exit('拒绝启动：监听 %s 但未设置密码。\n'
                  '请设置环境变量 NOVEL_PASSWORD 或使用 --password-file；'
                  '若确定只在可信内网使用，可加 --insecure-no-password。' % args.host)
+    hosts = [h.strip().lower() for h in args.allow_host]
+    bad = [h for h in hosts if not h or any(c in h for c in '*/ ')]
+    if bad:
+        sys.exit('--allow-host 只接受完整的域名（不支持通配符）：%s' % ', '.join(repr(h) for h in bad))
     lib = Library(args.db, args.library)
-    app = App(lib, password=pw, name=args.name, host_check=(not pw and loop), quiet=args.quiet)
+    app = App(lib, password=pw, name=args.name, host_check=not pw and (loop or bool(hosts)), quiet=args.quiet,
+              allowed_hosts=hosts)
     srv = make_server(app, args.host, args.port)
     if not args.no_scan:
         threading.Thread(target=lib.scan, kwargs={'log': _log_scan}, daemon=True, name='scan').start()
@@ -52,6 +57,9 @@ def cmd_serve(args):
     print('novelsite %s  http://%s:%d/\n  书库：%s\n  数据库：%s\n  密码：%s'
           % (__version__, shown, args.port, lib.root, os.path.abspath(args.db), '已启用' if pw else '未启用'),
           file=sys.stderr)
+    if hosts and not pw:
+        print('  允许的域名：%s\n  注意：未设置密码，访问控制完全依赖前置代理（如 Cloudflare Access）。'
+              % ', '.join(hosts), file=sys.stderr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -95,6 +103,8 @@ def main(argv=None):
     s.add_argument('--no-scan', action='store_true', help='启动时不扫描书库')
     s.add_argument('--quiet', '-q', action='store_true', help='不输出访问日志')
     s.add_argument('--insecure-no-password', action='store_true', help='允许在非本机地址上无密码运行')
+    s.add_argument('--allow-host', action='append', default=[], metavar='域名',
+                   help='未设密码时额外允许的访问域名（如 Cloudflare Tunnel 的公网域名），可重复指定')
     s.set_defaults(func=cmd_serve)
 
     s = sub.add_parser('scan', help='只扫描书库然后退出')

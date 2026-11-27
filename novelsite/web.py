@@ -182,11 +182,14 @@ PUBLIC = {'login_form', 'login', 'static', 'robots'}
 
 
 class App:
-    def __init__(self, lib, password='', name='书库', host_check=False, quiet=False):
+    def __init__(self, lib, password='', name='书库', host_check=False, quiet=False, allowed_hosts=()):
         self.lib = lib
         self.name = name
         self.password = password
         self.host_check = host_check
+        # 未设密码时只接受这些 Host：本机名，加上明确声明的域名（如经 Cloudflare Tunnel 访问的域名）。
+        # 攻击者用 DNS rebinding 时 Host 是他自己的域名，仍会被拒绝。
+        self.allowed_hosts = frozenset(LOOPBACK_NAMES) | {host_of(h) for h in allowed_hosts}
         self.quiet = quiet
         self._key = b''
         if password:
@@ -205,8 +208,9 @@ class App:
 
     # ------------------------------------------------------------ 分发
     def dispatch(self, h, method):
-        if self.host_check and host_of(h.headers.get('Host')) not in LOOPBACK_NAMES:
-            return self.error(403, '未设置密码时只允许通过 localhost / 127.0.0.1 访问。')
+        if self.host_check and host_of(h.headers.get('Host')) not in self.allowed_hosts:
+            return self.error(403, '未设置密码时只允许通过 localhost / 127.0.0.1 访问；'
+                                   '经反向代理或 Cloudflare Tunnel 访问时，请用 --allow-host 声明域名，或设置密码。')
         url = urlsplit(h.path)
         try:
             query = {k: v[0] for k, v in parse_qs(url.query, keep_blank_values=True,
