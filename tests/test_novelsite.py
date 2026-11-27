@@ -250,6 +250,7 @@ class TestScanMeta(TempDirCase):
 
 class TestWeb(TempDirCase):
     password = ''
+    allowed_hosts = ()
 
     def setUp(self):
         super().setUp()
@@ -258,7 +259,8 @@ class TestWeb(TempDirCase):
         self.write('lib/<b onmouseover=alert(1)>.txt', make_novel(2).encode('utf-8'))
         self.lib = Library(os.path.join(self.dir, 'db.sqlite'), lib_dir)
         self.lib.scan()
-        self.app = App(self.lib, password=self.password, host_check=not self.password, quiet=True)
+        self.app = App(self.lib, password=self.password, host_check=not self.password, quiet=True,
+                       allowed_hosts=self.allowed_hosts)
         self.srv = make_server(self.app, '127.0.0.1', 0)
         self.base = 'http://127.0.0.1:%d' % self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
@@ -409,6 +411,23 @@ class TestWebNoPassword(TestWeb):
         self.assertEqual(self.req('/rules', form, {'Origin': 'http://evil.example'})[0], 403)
         self.assertEqual(self.lib.one('SELECT COUNT(*) FROM rules')[0], 0)
         self.assertEqual(self.req('/rules/delete', b'id=1&back=//evil.example')[0], 303)
+
+
+class TestWebAllowHost(TestWeb):
+    allowed_hosts = ('Novel.Example.com',)
+
+    def test_declared_host_is_accepted_others_rejected(self):
+        bid = self.book_id('测试之书')
+        for host in ('novel.example.com', 'NOVEL.example.com:443', 'localhost'):
+            self.assertEqual(self.req('/', headers={'Host': host})[0], 200, host)
+        for host in ('attacker.example', 'novel.example.com.attacker.example', 'example.com'):
+            self.assertEqual(self.req('/', headers={'Host': host})[0], 403, host)
+        # 经隧道的 POST：Origin 与 Host 都是公网域名，同源校验通过
+        hdr = {'Host': 'novel.example.com', 'Origin': 'https://novel.example.com'}
+        self.assertEqual(self.req('/shelf', ('id=%d&on=1&back=/' % bid).encode(), hdr)[0], 303)
+        self.assertTrue(self.lib.on_shelf(bid))
+        hdr['Origin'] = 'https://attacker.example'
+        self.assertEqual(self.req('/shelf', ('id=%d&on=0&back=/' % bid).encode(), hdr)[0], 403)
 
 
 class TestWebPassword(TestWeb):

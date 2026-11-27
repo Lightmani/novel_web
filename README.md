@@ -45,6 +45,7 @@ NOVEL_PASSWORD='一个长密码' python3 -m novelsite serve --library /data/nove
 | `  --db FILE` | 数据库位置 |
 | `  --name 书库` | 站点名称 |
 | `  --password-file F` | 密码文件（或环境变量 `NOVEL_PASSWORD`） |
+| `  --allow-host 域名` | 未设密码时额外允许的访问域名（如 Cloudflare Tunnel 的公网域名），可重复指定 |
 | `  --no-scan` / `--quiet` | 启动时不扫描 / 不打印访问日志 |
 | `scan --library DIR` | 只扫描然后退出（适合放进 cron） |
 | `  --prune` | 缺失文件超过一半时仍执行删除（默认会拒绝，见下文） |
@@ -100,6 +101,27 @@ location / {
     proxy_set_header X-Forwarded-Proto $scheme;  # 让登录 Cookie 带上 Secure 标记
 }
 ```
+
+### Cloudflare Tunnel
+
+程序只监听 `127.0.0.1`，由 cloudflared 把公网域名转发进来，本机不开放任何端口。cloudflared 会把公网域名原样作为 `Host` 转发，而未设密码时程序只接受 `localhost`（防 DNS rebinding），所以直接访问会得到 403。二选一：
+
+- **设置密码**：和上文一样设 `NOVEL_PASSWORD` 或 `--password-file`，Host 检查随之关闭。
+- **由 Cloudflare Access 负责登录、程序不设密码**：用 `--allow-host` 声明公网域名（只接受完整域名，不支持通配符）：
+
+```bash
+python3 -m novelsite serve --library /data/novels --allow-host novel.example.com
+```
+
+```yaml
+# cloudflared 的 config.yml
+ingress:
+  - hostname: novel.example.com
+    service: http://127.0.0.1:8080
+  - service: http_status:404
+```
+
+不设密码时，访问控制完全落在 Cloudflare 一侧。请用 **Cloudflare Access** 这类按身份登录的策略（如邮箱验证码），而不是只按国家 / 地区或 ASN 放行的 WAF 规则：后者等于对整片地区公开整个书库，任何人都能下载全部书籍、改书架、进度和替换规则、触发扫描。
 
 ## 设计取舍
 
