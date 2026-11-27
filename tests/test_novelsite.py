@@ -91,6 +91,24 @@ class TestFilename(unittest.TestCase):
             self.assertEqual((t, a, s), (title, author, sure), name)
         self.assertEqual(tp.parse_filename('[玄幻]斗破苍穹')[2], '玄幻')
 
+    def test_serial_number_prefix(self):
+        # 「编号_书名」：编号不是书名，下划线后面也不是作者
+        cases = {
+            '1006_小琳': ('小琳', '', False),
+            '1006 小琳': ('小琳', '', False),
+            '1006-小琳（完结）': ('小琳', '', False),
+            '1006.小琳': ('小琳', '', False),
+            '1006、小琳': ('小琳', '', False),
+            '１００６＿小琳': ('小琳', '', False),
+            '0012_小琳_续集': ('小琳_续集', '', False),
+            '1006_《小琳》作者：张三': ('小琳', '张三', True),
+            '3.5亿的人生': ('3.5亿的人生', '', False),
+            '1984': ('1984', '', False),
+        }
+        for name, (title, author, sure) in cases.items():
+            t, a, _, s = tp.parse_filename(name)
+            self.assertEqual((t, a, s), (title, author, sure), name)
+
     def test_head_meta(self):
         author, intro = tp.extract_head_meta(make_novel(2))
         self.assertEqual(author, '张三')
@@ -203,6 +221,30 @@ class TestReplacer(TempDirCase):
         out = b''.join(lib.iter_utf8(book, lib.toc(book), tp.Replacer({'萧炎': '李明'}))).decode('utf-8')
         self.assertEqual((out.count('李明'), out.count('萧炎')), (6, 0))
         self.assertTrue(out.startswith('第1章 开始\naaa'))
+        lib.conn.close()
+
+
+class TestScanMeta(TempDirCase):
+    def test_numbered_file_and_refresh_of_old_metadata(self):
+        self.write('lib/言情/1006_小琳.txt', make_novel(2).encode('utf-8'))  # 文件头有「作者：张三」
+        self.write('lib/言情/1007_小雨.txt', '第1章 开始\n正文。\n'.encode('utf-8'))  # 文件头没有作者
+        db, root = os.path.join(self.dir, 'db.sqlite'), os.path.join(self.dir, 'lib')
+        lib = Library(db, root)
+        lib.scan()
+        rows = {r['title']: (r['author'], r['category']) for r in lib.query('SELECT * FROM books')}
+        self.assertEqual(rows, {'小琳': ('张三', '言情'), '小雨': ('', '言情')})
+        # 模拟旧版本留下的错误元数据：书名是编号、作者是书名，且没有记录元数据版本
+        bid = lib.one("SELECT id FROM books WHERE title='小琳'")[0]
+        lib.execute("UPDATE books SET title='1006', author='小琳' WHERE id=?", (bid,))
+        lib.execute("DELETE FROM meta WHERE k='meta_version'")
+        lib.set_shelf(bid, True)
+        lib.scan()
+        self.assertEqual(lib.scan_state['refreshed'], 2)
+        row = lib.book(bid)  # 同一个 id：书架、进度、替换规则都保留
+        self.assertEqual((row['title'], row['author']), ('小琳', '张三'))
+        self.assertTrue(lib.on_shelf(bid))
+        lib.scan()  # 版本已记录，之后的扫描不再重复刷新
+        self.assertEqual(lib.scan_state['refreshed'], 0)
         lib.conn.close()
 
 

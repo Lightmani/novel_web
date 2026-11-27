@@ -749,9 +749,10 @@ class App:
             scan = ('<p class="notice">扫描中：%s · 已发现 %d 本 · 已处理 %d / %d · 新增 %d</p>'
                     % (esc(st['phase']), st['found'], st['done'], st['total'], st['added']))
         elif st.get('finished'):
-            scan = ('<p>上次扫描：%s，用时 %.1f 秒。发现 %d 本，新增 %d，更新 %d，移动 %d，移除 %d。</p>'
+            scan = ('<p>上次扫描：%s，用时 %.1f 秒。发现 %d 本，新增 %d，更新 %d，移动 %d，移除 %d%s。</p>'
                     % (fmt_time(st['finished']), st['finished'] - st['started'], st['found'], st['added'],
-                       st['updated'], st['moved'], st['removed']))
+                       st['updated'], st['moved'], st['removed'],
+                       '，按新规则刷新书名/作者 %d' % st['refreshed'] if st.get('refreshed') else ''))
         else:
             scan = '<p>本次运行尚未扫描。</p>'
         if st.get('error'):
